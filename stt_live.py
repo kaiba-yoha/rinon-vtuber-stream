@@ -48,30 +48,33 @@ def list_devices():
 
 
 def read_audio_from_srt(port: int, samplerate: int, blocksize: int, audio_q: queue.Queue):
-    """FFmpegでSRTリスナーを立て、PCM音声をブロック単位でqueueに流す。"""
+    """FFmpegでSRTリスナーを立て、PCM音声をブロック単位でqueueに流す。切断時は自動再接続。"""
     cmd = [
         FFMPEG, "-loglevel", "error",
         "-i", f"srt://0.0.0.0:{port}?mode=listener&latency=200",
-        "-vn",                      # 映像なし
-        "-f", "s16le",              # 16bit PCM little-endian
+        "-vn",               # 映像なし（送信側がmpegts/aacでも映像なしなのでOK）
+        "-f", "s16le",       # 16bit PCM little-endian
         "-ar", str(samplerate),
-        "-ac", "1",                 # mono
+        "-ac", "1",          # mono
         "pipe:1",
     ]
-    print(f"[srt] Waiting for mic stream on port {port}...")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     bytes_per_block = blocksize * 2  # int16 = 2 bytes
-    try:
-        while True:
-            raw = proc.stdout.read(bytes_per_block)
-            if not raw:
-                print("[srt] Stream ended or FFmpeg exited.", file=sys.stderr)
-                break
-            block = np.frombuffer(raw, dtype=np.int16)
-            if len(block) == blocksize:
-                audio_q.put(block)
-    finally:
-        proc.terminate()
+    while True:
+        print(f"[srt] Waiting for mic stream on port {port}...")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                raw = proc.stdout.read(bytes_per_block)
+                if not raw:
+                    break
+                block = np.frombuffer(raw, dtype=np.int16)
+                if len(block) == blocksize:
+                    audio_q.put(block)
+        finally:
+            proc.terminate()
+            proc.wait()
+        print("[srt] Disconnected. Waiting for reconnect...", file=sys.stderr)
+        time.sleep(1)
 
 
 def rms(block: np.ndarray) -> float:
