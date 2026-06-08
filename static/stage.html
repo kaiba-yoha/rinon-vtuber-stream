@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VTuber Stage</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: transparent;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+    font-family: 'Hiragino Kaku Gothic Pro', 'Yu Gothic UI', 'Meiryo', sans-serif;
+  }
+
+  #stage {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+
+  #portrait {
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    max-height: 95vh;
+    max-width: 70vw;
+    object-fit: contain;
+    image-rendering: -webkit-optimize-contrast;
+    transition: transform 0.08s ease-out, filter 0.1s ease-out;
+    transform-origin: bottom center;
+    user-select: none;
+    pointer-events: none;
+  }
+
+  #portrait.idle {
+    animation: idle-breathe 4s ease-in-out infinite;
+  }
+
+  #portrait.speaking {
+    animation: none;
+    transform: translateX(-50%) scaleY(var(--talk-scale, 1)) translateY(var(--talk-y, 0px));
+  }
+
+  @keyframes idle-breathe {
+    0%, 100% { transform: translateX(-50%) scaleY(1) translateY(0px); }
+    50%       { transform: translateX(-50%) scaleY(1.003) translateY(-3px); }
+  }
+
+  #mouth-canvas {
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.05s;
+  }
+
+  #mouth-canvas.speaking {
+    opacity: 1;
+  }
+
+  #subtitle-wrap {
+    position: absolute;
+    bottom: 28px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 82%;
+    max-width: 860px;
+    text-align: center;
+    pointer-events: none;
+  }
+
+  #subtitle {
+    display: inline-block;
+    font-size: clamp(18px, 2.6vw, 30px);
+    font-weight: bold;
+    color: #fff;
+    line-height: 1.55;
+    text-shadow:
+      2px  2px 0 #000,
+     -2px -2px 0 #000,
+      2px -2px 0 #000,
+     -2px  2px 0 #000,
+      0    3px 6px rgba(0,0,0,0.7);
+    background: rgba(0,0,0,0.35);
+    padding: 8px 20px 10px;
+    border-radius: 10px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    backdrop-filter: blur(0); /* avoids Chrome 1px border bug */
+  }
+
+  #subtitle.visible { opacity: 1; }
+
+  #status-dot {
+    position: absolute;
+    top: 14px;
+    right: 18px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #555;
+    transition: background 0.3s;
+  }
+  #status-dot.ready   { background: #2ecc71; }
+  #status-dot.speaking { background: #e74c3c; animation: pulse 0.6s ease-in-out infinite alternate; }
+  #status-dot.loading { background: #f39c12; animation: pulse 0.8s ease-in-out infinite alternate; }
+
+  @keyframes pulse {
+    from { opacity: 1; }
+    to   { opacity: 0.3; }
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="portrait" class="idle" src="" alt="" draggable="false">
+  <canvas id="mouth-canvas" width="160" height="60"></canvas>
+  <div id="subtitle-wrap"><span id="subtitle"></span></div>
+  <div id="status-dot"></div>
+</div>
+<audio id="player" crossorigin="anonymous"></audio>
+
+<script>
+// ---- Config ----
+const POLL_INTERVAL_MS = 600;
+const SUBTITLE_LINGER_MS = 2000;
+const MOUTH_CANVAS_W = 160;
+const MOUTH_CANVAS_H = 60;
+
+// ---- State ----
+let lastId = 0;
+let queue = [];
+let isSpeaking = false;
+let subtitleTimer = null;
+let characters = {};
+let currentExpression = 'neutral';
+let audioCtx = null;
+let analyser = null;
+let sourceNode = null;
+let animFrame = null;
+
+const portrait = document.getElementById('portrait');
+const player   = document.getElementById('player');
+const subtitle = document.getElementById('subtitle');
+const statusDot = document.getElementById('status-dot');
+const mouthCanvas = document.getElementById('mouth-canvas');
+const mouthCtx = mouthCanvas.getContext('2d');
+
+// ---- Boot ----
+async function init() {
+  try {
+    const res = await fetch('/api/characters');
+    const data = await res.json();
+    const chars = Array.isArray(data.characters) ? data.characters : [];
+    for (const c of chars) characters[c.id] = c;
+
+    // Default to first character
+    const first = chars[0];
+    if (first) setPortrait(first.portrait || `/${first.id}/expressions/neutral/neutral.png`);
+
+    const init_res = await fetch('/api/speak-events?after=latest');
+    const init_data = await init_res.json();
+    lastId = init_data.latestId || 0;
+    statusDot.className = 'ready';
+  } catch(e) {
+    console.error('init error', e);
+  }
+  setInterval(pollEvents, POLL_INTERVAL_MS);
+}
+
+// ---- Events ----
+async function pollEvents() {
+  try {
+    const res = await fetch(`/api/speak-events?after=${lastId}`);
+    const data = await res.json();
+    const events = Array.isArray(data.events) ? data.events : [];
+    if (events.length) {
+      lastId = data.latestId;
+      for (const ev of events) enqueueEvent(ev);
+    }
+  } catch(e) {}
+}
+
+function enqueueEvent(ev) {
+  const audios = Array.isArray(ev.audios) ? ev.audios : [];
+  if (!audios.length) return;
+
+  for (const a of audios) {
+    queue.push({
+      url: a.url,
+      text: a.text || ev.text || '',
+      expression: ev.expression || 'neutral',
+      speakerSlot: ev.speakerSlot || 'main',
+    });
+  }
+  if (!isSpeaking) playNext();
+}
+
+// ---- Playback ----
+function playNext() {
+  if (!queue.length) {
+    isSpeaking = false;
+    setPortrait(expressionUrl(currentExpression));
+    portrait.className = 'idle';
+    mouthCanvas.className = '';
+    statusDot.className = 'ready';
+    hideSubtitle();
+    cancelAnimationFrame(animFrame);
+    return;
+  }
+  isSpeaking = true;
+  const item = queue.shift();
+  currentExpression = item.expression;
+  setPortrait(expressionUrl(item.expression));
+  portrait.className = 'speaking';
+  mouthCanvas.className = 'speaking';
+  statusDot.className = 'speaking';
+  showSubtitle(item.text);
+
+  // Unlock audio context on first play
+  if (!audioCtx) initAudioCtx();
+
+  player.src = item.url;
+  player.play().catch(() => {});
+}
+
+player.addEventListener('ended', playNext);
+player.addEventListener('error', playNext);
+
+// ---- Audio Analysis → Mouth ----
+function initAudioCtx() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.6;
+  sourceNode = audioCtx.createMediaElementSource(player);
+  sourceNode.connect(analyser);
+  analyser.connect(audioCtx.destination);
+  animateMouth();
+}
+
+function animateMouth() {
+  animFrame = requestAnimationFrame(animateMouth);
+  if (!isSpeaking) return;
+
+  const buf = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteTimeDomainData(buf);
+
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = (buf[i] - 128) / 128;
+    sum += v * v;
+  }
+  const rms = Math.sqrt(sum / buf.length);
+  const amplitude = Math.min(rms * 5, 1);  // 0..1
+
+  // Animate portrait scale
+  const scaleY = 1 + amplitude * 0.012;
+  const ty = -(amplitude * 4);
+  portrait.style.setProperty('--talk-scale', scaleY);
+  portrait.style.setProperty('--talk-y', ty + 'px');
+
+  // Draw mouth
+  drawMouth(amplitude);
+}
+
+function drawMouth(amp) {
+  const w = MOUTH_CANVAS_W;
+  const h = MOUTH_CANVAS_H;
+  mouthCtx.clearRect(0, 0, w, h);
+
+  const cx = w / 2;
+  const cy = h / 2 + 4;
+  const rx = 24 + amp * 18;
+  const ry = 4 + amp * 16;
+
+  // Shadow
+  mouthCtx.beginPath();
+  mouthCtx.ellipse(cx, cy + 2, rx + 2, ry + 2, 0, 0, Math.PI * 2);
+  mouthCtx.fillStyle = 'rgba(0,0,0,0.5)';
+  mouthCtx.fill();
+
+  // Mouth fill (dark interior)
+  mouthCtx.beginPath();
+  mouthCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  mouthCtx.fillStyle = '#2a0a10';
+  mouthCtx.fill();
+
+  // Lip outline
+  mouthCtx.beginPath();
+  mouthCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  mouthCtx.strokeStyle = `rgba(220,80,110,${0.6 + amp * 0.4})`;
+  mouthCtx.lineWidth = 2.5;
+  mouthCtx.stroke();
+
+  // Teeth (show when open)
+  if (amp > 0.15) {
+    const toothH = Math.min((amp - 0.15) / 0.85 * 10, 10);
+    mouthCtx.beginPath();
+    mouthCtx.rect(cx - rx * 0.6, cy - toothH / 2, rx * 1.2, toothH);
+    mouthCtx.fillStyle = 'rgba(255,245,240,0.85)';
+    mouthCtx.fill();
+  }
+}
+
+// ---- Portrait / Expression ----
+function setPortrait(url) {
+  if (url && portrait.src !== location.origin + url) portrait.src = url;
+}
+
+function expressionUrl(expression) {
+  // Find from loaded characters data
+  for (const c of Object.values(characters)) {
+    if (c.expressions && c.expressions[expression] && c.expressions[expression].length) {
+      return c.expressions[expression][0];
+    }
+  }
+  // Fallback
+  for (const c of Object.values(characters)) {
+    if (c.portrait) return c.portrait;
+  }
+  return '';
+}
+
+// ---- Subtitle ----
+function showSubtitle(text) {
+  if (!text) return;
+  clearTimeout(subtitleTimer);
+  subtitle.textContent = text;
+  subtitle.className = 'visible';
+}
+
+function hideSubtitle() {
+  clearTimeout(subtitleTimer);
+  subtitleTimer = setTimeout(() => {
+    subtitle.className = '';
+  }, SUBTITLE_LINGER_MS);
+}
+
+// Unlock AudioContext on first user interaction (Chrome autoplay policy)
+document.addEventListener('click', () => {
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}, { once: true });
+
+init();
+</script>
+</body>
+</html>
