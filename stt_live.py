@@ -47,34 +47,26 @@ def list_devices():
     print(sd.query_devices())
 
 
-def read_audio_from_srt(port: int, samplerate: int, blocksize: int, audio_q: queue.Queue):
-    """FFmpegでSRTリスナーを立て、PCM音声をブロック単位でqueueに流す。切断時は自動再接続。"""
-    cmd = [
-        FFMPEG, "-loglevel", "error",
-        "-i", f"srt://0.0.0.0:{port}?mode=listener&latency=200",
-        "-vn",               # 映像なし（送信側がmpegts/aacでも映像なしなのでOK）
-        "-f", "s16le",       # 16bit PCM little-endian
-        "-ar", str(samplerate),
-        "-ac", "1",          # mono
-        "pipe:1",
-    ]
+def read_audio_from_udp(port: int, samplerate: int, blocksize: int, audio_q: queue.Queue):
+    """UDPで raw s16le PCM を受信してqueueに流す。再接続不要・シンプル。"""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", port))
+    sock.settimeout(5.0)
     bytes_per_block = blocksize * 2  # int16 = 2 bytes
+    buf = bytearray()
+    print(f"[udp] Waiting for mic stream on UDP port {port}...")
     while True:
-        print(f"[srt] Waiting for mic stream on port {port}...")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            while True:
-                raw = proc.stdout.read(bytes_per_block)
-                if not raw:
-                    break
-                block = np.frombuffer(raw, dtype=np.int16)
-                if len(block) == blocksize:
-                    audio_q.put(block)
-        finally:
-            proc.terminate()
-            proc.wait()
-        print("[srt] Disconnected. Waiting for reconnect...", file=sys.stderr)
-        time.sleep(1)
+            data, addr = sock.recvfrom(65536)
+            buf.extend(data)
+            while len(buf) >= bytes_per_block:
+                chunk = bytes(buf[:bytes_per_block])
+                del buf[:bytes_per_block]
+                block = np.frombuffer(chunk, dtype=np.int16)
+                audio_q.put(block)
+        except socket.timeout:
+            pass  # 無音期間は継続待機
 
 
 def rms(block: np.ndarray) -> float:
@@ -146,9 +138,8 @@ def run(args):
 
     # ---- Audio source: SRT (remote mic) or local sounddevice ----
     if args.srt_port:
-        # Open firewall port for SRT mic stream
         t = threading.Thread(
-            target=read_audio_from_srt,
+            target=read_audio_from_udp,
             args=(args.srt_port, args.samplerate, args.blocksize, audio_q),
             daemon=True,
         )
@@ -205,8 +196,8 @@ def run(args):
     proc_thread.start()
 
     if args.srt_port:
-        print(f"[srt] Mic stream port {args.srt_port} | lang={args.lang}")
-        print(f"[srt] On the other PC, run: send_mic_srt.bat")
+        print(f"[udp] Mic stream UDP port {args.srt_port} | lang={args.lang}")
+        print(f"[udp] On the other PC, run: send_mic_udp.bat")
         try:
             while True:
                 time.sleep(0.1)
