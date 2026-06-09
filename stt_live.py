@@ -34,10 +34,27 @@ DEFAULT_BLOCKSIZE  = 1024     # ~64ms per block at 16kHz
 DEFAULT_SILENCE_BLOCKS = 18   # ~1.1s of silence → end of utterance
 MAX_SPEECH_BLOCKS = 400       # ~25s max utterance length
 DEFAULT_CAPTION = (
-    "Native Japanese young adult woman, cute anime assistant voice, "
-    "warm and intimate conversational acting, slightly teasing little-devil smile, "
-    "soft breath, gentle emotional nuance, clear pronunciation, clean studio sound."
+    "Cute slime creature character voice, cheerful and bubbly personality, "
+    "playful and energetic tone, slightly squeaky and bouncy delivery, "
+    "warm and friendly, clear pronunciation, clean studio sound."
 )
+
+# ---- Emotion detection (keyword → emoji for Irodori TTS) ----
+_HAPPY_KW    = ["嬉しい","楽しい","ありがとう","好き","最高","やった","うれしい","たのしい","さいこう"]
+_SAD_KW      = ["悲しい","つらい","辛い","泣く","かなしい"]
+_SURPRISE_KW = ["えっ","まじ","やばい","すごい","びっくり","嘘","うそ","マジ","ヤバ","ウソ"]
+
+def detect_emoji(text: str) -> str:
+    for kw in _HAPPY_KW:
+        if kw in text:
+            return "😆"
+    for kw in _SAD_KW:
+        if kw in text:
+            return "😭"
+    for kw in _SURPRISE_KW:
+        if kw in text:
+            return "😱"
+    return ""
 
 
 FFMPEG = r"D:\Dev\ffmpeg-7.1-full_build\bin\ffmpeg.exe"
@@ -115,8 +132,9 @@ def transcribe_and_send(
     if not text:
         print("[stt] (empty transcript, skipped)")
         return
-    print(f"[stt] → {text}")
-    ok = send_speak(api_base, text, caption)
+    emoji = detect_emoji(text)
+    print(f"[stt] → {text}  {emoji or '(neutral)'}")
+    ok = send_speak(api_base, text, caption, emoji)
     if ok:
         print("[speak] queued ✓")
 
